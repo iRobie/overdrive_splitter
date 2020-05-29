@@ -2,6 +2,7 @@
 import argparse
 import os
 import subprocess
+from shutil import copyfile
 import sys
 import datetime
 import time
@@ -18,6 +19,9 @@ import eyed3
 from eyed3.utils import art
 from mutagen.mp3 import MP3
 
+import numpy
+import json
+
 logger = logging.getLogger(__file__)
 ch = logging.StreamHandler()
 ch.setLevel(logging.WARN)
@@ -25,9 +29,10 @@ logger.addHandler(ch)
 logger.setLevel(logging.INFO)
 
 #### OPTIONS ######
-output_debug_csvs = False
+output_debug_csvs = True
 title_include_track_number = False # True: 01/09 - Title; False: Title
 overwrite_mp3tags = True # Write mp3 tags, even if ffmpeg doesn't process the file
+moveChapterToSilenceSeconds = 5 # If silence is found within this many seconds, move chapter mark to silence
 ###################
 
 __version__ = '0.1.0'  
@@ -35,10 +40,6 @@ __version__ = '0.1.0'
 MARKER_TIMESTAMP_MMSS = r'(?P<min>[0-9]+):(?P<sec>[0-9]+)\.(?P<ms>[0-9]+)'
 MARKER_TIMESTAMP_HHMMSS = r'(?P<hr>[0-9]+):(?P<min>[0-9]+):(?P<sec>[0-9]+)\.(?P<ms>[0-9]+)'
 
-title = ""
-author = ""
-year = 0
-starttime_offset = 0
 
 def hhmmss_to_seconds(marker_timestamp):
     """
@@ -71,19 +72,29 @@ def hhmmss_to_seconds(marker_timestamp):
                 raise ValueError('Invalid marker timestamp: {}'.format(marker_timestamp))
     return ts_mark
 
-def convert_time(time_secs, offset):
+def convert_time(time_secs):
     """
     Convert seconds to HH MM SS (FFF)
     Offset is how many seconds to subtract from the original value
     """
-    if time_secs > 0:
-        time_secs = time_secs - offset
     fraction = int((time_secs % 1) * 1000)
     seconds = int(time_secs)
     min, sec = divmod(seconds, 60)
     hour, min = divmod(min, 60)
     return f"{hour:02}:{min:02}:{sec:02}.{fraction:03}"
 
+
+def closestSilence(times, chapter, threshold):   
+    """
+    Searching silence list for chapter mark, within threshold
+    Returns a value if found
+    Returns original marker if not found
+    """
+
+    logger.debug("Checking for closest silence to {}".format(chapter))
+    closest = times[min(range(len(times)), key = lambda i: abs(times[i]-chapter))]
+    logger.debug("Returning {}".format(closest))
+    return closest
 
 def mp3_duration_seconds(filename):
     # Ref: https://github.com/ping/odmpy/pull/3
@@ -95,6 +106,20 @@ def mp3_duration_seconds(filename):
     # mutagen does not have this issue
     audio = MP3(filename)
     return int(round(audio.info.length))
+
+def getDirectories(base_directory):
+
+    filepaths = {}
+    filepaths['base_directory'] = base_directory ## Folder to store completed project. I set this as: BookTitle (Year)
+    filepaths['output_name'] = u'{} ({})'.format(make_safe_filename(title), str(year)) ## Folder to store completed project. I set this as: BookTitle (Year)
+    filepaths['output_path'] = u'{}/{}'.format(base_directory, filepaths['output_name']) ## Making the final folder stay as a subdir of processing directory
+    filepaths['temp_path'] = u'{}/{}'.format(base_directory, 'temp') ## Making the final folder stay as a subdir of processing directory
+
+    for key, value in filepaths.items():
+        if 'path' in key:
+            if not os.path.exists(value):
+                os.makedirs(value)
+    return filepaths
 
 def checkKey(dict, key): 
     """
@@ -141,11 +166,81 @@ def verifyTitle(filename):
 
     year = input("Book Year: ")
 
+def findsilence(part_filename):
+    global silenceparts
+    # Load your audio.
+    silenceseconds = 1
+    thresholdamp = 0.01
+
+    dur = float(silenceseconds)
+    thr = int(float(thresholdamp) * 65535)
+
+    tmprate = 22050
+    len2 = dur * tmprate
+    buflen = int(len2     * 2)
+    #            t * rate * 16 bits
+
+    oarr = numpy.arange(1, dtype='int16')
+    # just a dummy array for the first chunk
+
+    command = [ 
+            'ffmpeg', '-y',
+            '-hide_banner',
+            '-loglevel', 'info' if logger.level == logging.DEBUG else 'error', '-stats',
+            '-i', part_filename,
+            '-f', 's16le',
+            '-acodec', 'pcm_s16le',
+            '-ar', str(tmprate), # ouput sampling rate
+            '-ac', '1', # '1' for mono
+            '-']        # - output to stdout
+
+    pipe = subprocess.Popen(command, stdout=subprocess.PIPE, bufsize=10**8)
+
+    tf = True
+    pos = 0
+    opos = 0
+    part = 0
+
+    silencearray = []
+
+    while tf :
+
+        raw = pipe.stdout.read(buflen)
+        if raw == '' :
+            tf = False
+            break
+
+        arr = numpy.fromstring(raw, dtype = "int16")
+
+        rng = numpy.concatenate([oarr, arr])
+        try:
+            mx = numpy.amax(rng)
+        except:
+            break ## End of file
+        if mx <= thr :
+            # the peak in this range is less than the threshold value
+            trng = (rng <= thr) * 1
+            # effectively a pass filter with all samples <= thr set to 0 and > thr set to 1
+            sm = numpy.sum(trng)
+            # i.e. simply (naively) check how many 1's there were
+            if sm >= len2 :
+                part += 1
+                apos = pos + dur * 0.5
+                print(mx, sm, len2, apos)
+                silencearray.append(opos)
+                opos = apos
+
+        pos += dur
+
+        oarr = arr
+
+    silenceparts[make_safe_filename(part_filename)] = silencearray
+
 def build_chapter_object(part_filename):
     """
     Extracts Overdrive Markers from MP3 tag, stores them in list part_markers
     """
-    global part_markers, track_count, file_merged_start_time
+    global part_markers, track_count, file_merged_start_time, silenceparts
     audiofile = eyed3.load(part_filename)
     previous_chapter = "zycndkldms" ## Just a garbage value
 
@@ -186,12 +281,27 @@ def build_chapter_object(part_filename):
                 start_time = ts_mark
                 track_count += 1
 
+                old_start_time = start_time
+                closest_silence = closestSilence(silenceparts[make_safe_filename(part_filename)], ts_mark, moveChapterToSilenceSeconds)
+                silence_found = False
+                timedifference = abs(closest_silence-ts_mark)
+
+                if timedifference < moveChapterToSilenceSeconds:
+                    start_time = closest_silence
+                    silence_found = True
+
                 audiopart = {
                     'filename': part_filename, 
                     'file_number': track_count,
                     'chapter_name': marker_name,
                     'chapter_section': chapter_section,
-                    'start_time': start_time}
+                    'start_time': start_time,
+                    'old_start_time': old_start_time,
+                    'difference': timedifference,
+                    'silence_found': silence_found,
+                    'closest_silence': closest_silence,
+                    'start_time_hhmmss': convert_time(start_time),
+                    'closest_silence_hhmmss': convert_time(closest_silence)}
                 part_markers.append(audiopart)
         break
 
@@ -200,8 +310,6 @@ def smooshChapters(part_markers):
     Combine chapter parts, get earliest start time and latest end time for each combined
     chapter part
     """
-
-    global starttime_offset
 
     smooshed_chapters = []
 
@@ -214,7 +322,6 @@ def smooshChapters(part_markers):
         ## Get all parts that match this chapter
         chapters = df.loc[df['chapter_name'] == chapter]
 
-        split = None
         splitName = None
         track_number += 1
 
@@ -231,27 +338,35 @@ def smooshChapters(part_markers):
 
                 endtime = None
                 if index < len(unique_parts) - 1:
-                    endtime = convert_time(mp3_duration_seconds(parts.filename.min()), 0)
+                    endtime = convert_time(mp3_duration_seconds(parts['filename'].iloc[0]))
 
                 smooshed_chapter = {
-                    'filename': parts.filename.min(),
+                    'filename': parts['filename'].iloc[0],
                     'track_number': track_number,
-                    'chapter_name': chapters.chapter_name.min(),
-                    'split_name': parts.chapter_name.min() + splitName,
+                    'chapter_name': parts['chapter_name'].iloc[0],
+                    'split_name': parts['chapter_name'].iloc[0] + splitName,
                     'filenumber': parts.file_number.min(),
-                    'start_time': convert_time(parts.start_time.min(), starttime_offset),
-                    'end_time': endtime
+                    'start_time': convert_time(parts.start_time.min()),
+                    'end_time': endtime,
+                    'old_start_time': convert_time(parts.old_start_time.min()),
+                    'silence_found': parts['silence_found'].iloc[0],
+                    'closest_silence': convert_time(parts.closest_silence.min()),
+                    'difference': parts['difference'].iloc[0]
                 }
                 smooshed_chapters.append(smooshed_chapter)
         else:
             smooshed_chapter = {
-                'filename': chapters.filename.min(),
+                'filename': chapters['filename'].iloc[0],
                 'track_number': track_number,
-                'chapter_name': chapters.chapter_name.min(),
+                'chapter_name': chapters['chapter_name'].iloc[0],
                 'split_name': None,
                 'filenumber': chapters.file_number.min(),
-                'start_time': convert_time(chapters.start_time.min(), starttime_offset),
-                'end_time': None
+                'start_time': convert_time(chapters.start_time.min()),
+                'end_time': None,
+                'old_start_time': convert_time(chapters.old_start_time.min()),
+                'silence_found': chapters['silence_found'].iloc[0],
+                'closest_silence': convert_time(chapters.closest_silence.min()),
+                'difference': chapters['difference'].iloc[0]
             }
             smooshed_chapters.append(smooshed_chapter)
 
@@ -268,11 +383,11 @@ def smooshChapters(part_markers):
                 endtime = smooshed_chapters[index+1]["start_time"]
             ## No more files. End time is the end of the file.
             else:
-                endtime = convert_time(mp3_duration_seconds(chapter['filename']), 0)
+                endtime = convert_time(mp3_duration_seconds(chapter['filename']))
 
             ## It's possible the grabbed end time (start time of the next chapter) is 0, indicating a new MP3. In that case, the real end time is the end of the current file.
             if hhmmss_to_seconds(endtime) < 1:
-                endtime = convert_time(mp3_duration_seconds(chapter['filename']), 0)
+                endtime = convert_time(mp3_duration_seconds(chapter['filename']))
             chapter['end_time'] = endtime
 
     return smooshed_chapters, track_number
@@ -295,7 +410,7 @@ def writeMP3Tags(mp3file, chaptertitle, tracknumber):
 
     audiofile.tag.save()
 
-def writeChapterFiles(chapters, totaltracks, basedir):
+def writeChapterFiles(chapters, totaltracks):
     global failed_files
 
     leadingzeros = 2
@@ -305,15 +420,10 @@ def writeChapterFiles(chapters, totaltracks, basedir):
     ## Store items that need reprocessing
     needsmerging = []
     for chapter in chapters:
-        ## Set all the names. 
-        ### Store non-split chapters in final directory
- 
-        foldername = u'{} ({})'.format(title, str(year)) ## Folder to store completed project. I set this as: BookTitle (Year)
 
-        outdir = u'{}/{}'.format(basedir, foldername) ## Making the final folder stay as a subdir of processing directory
-        tempdir = u'{}/{}'.format(basedir, "temp") ## Directory to store temp files
+        ## Set all the names.  
         outputname = u'{} - {}.mp3'.format(str(chapter['track_number']).zfill(leadingzeros), make_safe_filename(chapter['chapter_name'])) ## MP3 name. I set as Track - Title
-        outputpath = u'{}/{}'.format(outdir, outputname) ## Tells ffmpeg this is the output for this part
+        outputpath = u'{}/{}'.format(filepaths['output_path'], outputname) ## Tells ffmpeg this is the output for this part
         
         outputtitle =  u'{}'.format(chapter['chapter_name'])
         if title_include_track_number:
@@ -324,7 +434,7 @@ def writeChapterFiles(chapters, totaltracks, basedir):
         ### Store split chapters in temp directory and save in needsmerging list
         if checkKey(chapter, 'split_name'):
             tempoutputname = u'{} - {}.mp3'.format(str(chapter['track_number']).zfill(leadingzeros), make_safe_filename(chapter['split_name'])) ## MP3 name. I set as.\sp Track - Title
-            tempoutputpath = u'{}/{}'.format(tempdir, tempoutputname)
+            tempoutputpath = u'{}/{}'.format(filepaths['temp_path'], tempoutputname)
             needsmerge = {
                 'filenumber': chapter['filenumber'],
                 'track_number': chapter['track_number'],
@@ -335,11 +445,6 @@ def writeChapterFiles(chapters, totaltracks, basedir):
             }
             needsmerging.append(needsmerge)
             outputpath = tempoutputpath
-
-        if not os.path.exists(outdir):
-            os.makedirs(outdir)
-        if not os.path.exists(tempdir):
-            os.makedirs(tempdir)
  
         writemp3tags = False
         if overwrite_mp3tags:
@@ -350,8 +455,9 @@ def writeChapterFiles(chapters, totaltracks, basedir):
         else:
             cmd = [
                 'ffmpeg', '-y',
-                '-i', chapter['filename'],
+                '-hide_banner',
                 '-loglevel', 'info' if logger.level == logging.DEBUG else 'error', '-stats',
+                '-i', chapter['filename'],
                 '-acodec', 'copy',
                 '-ss', chapter['start_time'],
                 '-to', chapter['end_time'],
@@ -427,9 +533,14 @@ file_merged_start_time = 0
 chapter_markers = []
 failed_files = []
 cover_bytes = None
+silenceparts = {}
+filepaths = {}
+title = ""
+author = ""
+year = 0
 
 def main():
-    global cover_bytes
+    global cover_bytes, silenceparts, filepaths
 
     ## Setup the directory that this is working on
     parser = argparse.ArgumentParser( )
@@ -444,11 +555,11 @@ def main():
     base_directory = base_directory.rstrip('"')
 
     base_directory = Path(base_directory)
-    
+
     if not os.path.exists(base_directory):
         print("Please select an existing directory for -d option")
         sys.exit(0)
-    
+
     ## Get all MP3s in current directory
     files = [f for f in glob.glob("{}/*.mp3".format(base_directory))]
     files.sort()
@@ -467,33 +578,95 @@ def main():
     ## Get title, author, year. TODO - improve this.
     verifyTitle(files[0])
 
-    ## Create a list containing each chapter and timestamp for every mp3 file
+    ## Set and create file directories
+    filepaths = getDirectories(base_directory)
+
+    ## Copy image to output directory
+    copyfile(cover_filename, "{}/{}".format(filepaths['output_path'], os.path.basename(cover_filename)))
+
+    ## Look for an load a previous silence file. This saves time on reprocessing.
+    silencefile = Path("{}/silenceparts.json".format(filepaths['temp_path'], ))
+    if silencefile.exists ():
+        f = open(silencefile,)
+        silenceparts = json.loads(f.read())
+
+    ## Scan MP3s for silence. This can take a while.
+    print('{}'.format(colored.green("-------------------")))
+    print('{}'.format(colored.green("Step 1/3: Scan MP3 for silence")))
+    print('{}'.format(colored.green("-------------------")))
+
+    start = time.time()
+    i = 0
+    total = len(files) + 1
+    for filename in files:
+        if checkKey(silenceparts, make_safe_filename(filename)):
+            logger.info("Silence already exists for {}".format(filename))
+            total = total - 1
+        else:
+            i += 1
+            percentcomplete = i / total
+            elapsedtime = time.time() - start
+            eta = elapsedtime / percentcomplete
+            remainingtime = convert_time(eta - elapsedtime)
+            if i == 1:
+                remainingtime = convert_time(50 * total) ## Takes roughly 50 seconds per file. Good enough for an estimate.
+            print('{}'.format(colored.green("File {} of {}  --  Remaining time: {}").format(i, total, remainingtime)))
+            findsilence(filename) 
+            with open(silencefile, "w") as f:
+                json.dump(silenceparts, f)
+
+    ## read embedded bookmark tags.
     for filename in files:
         build_chapter_object(filename)
+
+    if output_debug_csvs:
+        outputCSV(part_markers, '{}/partmarkers.csv'.format(filepaths['temp_path']))
 
     ## Combine chapter timestamps to have 1 output per chapter
     cuttimestamps, totaltracks = smooshChapters(part_markers)
 
     if output_debug_csvs:
-        outputCSV(cuttimestamps, '{}-cuttimestamps.csv'.format(make_safe_filename(title)))
+        outputCSV(cuttimestamps, '{}/cuttimestamps.csv'.format(filepaths['temp_path']))
 
     ## Split MP3s to chapters
-    needsmerging = writeChapterFiles(cuttimestamps, totaltracks, base_directory)
+    print('{}'.format(colored.green("-------------------")))
+    print('{}'.format(colored.green("Step 2/3: Save MP3s to chapter files")))
+    print('{}'.format(colored.green("-------------------")))
+
+    #needsmerging = []
+    needsmerging = writeChapterFiles(cuttimestamps, totaltracks)
 
     ## If any chapter spanned MP3s, combine them
+    print('{}'.format(colored.green("-------------------")))
+    print('{}'.format(colored.green("Step 3/3: Merge MP3s")))
+    print('{}'.format(colored.green("-------------------")))
+
     if len(needsmerging) > 0:
         if output_debug_csvs:
-            outputCSV(needsmerging, '{}-needsmerging.csv'.format(make_safe_filename(title)))
+            outputCSV(needsmerging, '{}/needsmerging.csv'.format(filepaths['temp_path']))
         processMerges(needsmerging)
+    else:
+        print("No files needed merging")
+
+    ## TODO copy silence parts and cover.jpg to output dir
+
 
     ## Write any failed files
     if len(failed_files) > 0:
         print("------")
         print("Following are failed files:")
-        for row in failed_files:
-            print(row)
-        outputCSV(failed_files, '{}-failed_files.csv'.format(make_safe_filename(title)))
+        logger.error('{}'.format(
+            colored.red("There were failures in this run.")))
+        print('Error log Saved to FAILURES-{}.csv'.format(make_safe_filename(title)))
+        outputCSV(failed_files, 'FAILURES-{}.csv'.format(make_safe_filename(title)))
 
+    ## Check for any chapters that weren't matched
+    for chapter in cuttimestamps:
+        ## Get all parts that match this chapter
+        if not chapter['silence_found']:
+            logger.error('{}'.format(
+                colored.red("Some chapters were placed on a spot without silence. Review the cuttimestamps.csv file.")))
+            break
 
 if __name__ == "__main__":
     main()
