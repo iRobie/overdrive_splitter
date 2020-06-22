@@ -107,11 +107,11 @@ def mp3_duration_seconds(filename):
     audio = MP3(filename)
     return int(round(audio.info.length))
 
-def getDirectories(base_directory):
+def getDirectories(base_directory, bookInfo):
 
     filepaths = {}
     filepaths['base_directory'] = base_directory ## Folder to store completed project. I set this as: BookTitle (Year)
-    filepaths['output_name'] = u'{} ({})'.format(make_safe_filename(title), str(year)) ## Folder to store completed project. I set this as: BookTitle (Year)
+    filepaths['output_name'] = u'{} ({})'.format(make_safe_filename(bookInfo["title"]), str(bookInfo["year"])) ## Folder to store completed project. I set this as: BookTitle (Year)
     filepaths['output_path'] = u'{}/{}'.format(base_directory, filepaths['output_name']) ## Making the final folder stay as a subdir of processing directory
     filepaths['temp_path'] = u'{}/{}'.format(base_directory, 'temp') ## Making the final folder stay as a subdir of processing directory
 
@@ -144,30 +144,51 @@ def make_safe_filename(s):
             return ""
     return "".join(safe_char(c) for c in s).rstrip("")
 
-def verifyTitle(filename):
+def verifyTitle(base_directory):
     """
     Reads title/author from MP3, sets title, author, year
     """
-    global title, author, year
+    bookInfo = {}
 
-    audiofile = eyed3.load(filename)
-    title = audiofile.tag.album
-    author = audiofile.tag.artist
+    ## Get an MP3 from the directory
 
-    print("Read title as: {}".format(title))
-    inputtitle = input("Press enter to accept, over enter new title: ")
-    if len(inputtitle) > 1:
-        title = inputtitle
+        ## Get all MP3s in current directory
+    files = [f for f in glob.glob("{}/*.mp3".format(base_directory))]
+    files.sort()
 
-    print("Read author as: {}".format(author))
-    inputauthor = input("Press enter to accept, over enter new title: ")
-    if len(inputauthor) > 1:
-        author = inputauthor
+    filename = files[0]
+    infoPath = Path("{}/bookinfo.json".format(base_directory))
 
-    year = input("Book Year: ")
+    if infoPath.exists ():
+        f = open(infoPath,)
+        bookInfo = json.loads(f.read())
+
+    else:
+        audiofile = eyed3.load(filename)
+        bookInfo["title"] = audiofile.tag.album
+        bookInfo["author"] = audiofile.tag.artist
+        bookInfo["path"] = str(base_directory)
+
+        print("Read title as: {}".format(bookInfo["title"]))
+        inputtitle = input("Press enter to accept, over enter new title: ")
+        if len(inputtitle) > 1:
+            bookInfo["title"] = inputtitle
+
+        print("Read author as: {}".format(bookInfo["author"]))
+        inputauthor = input("Press enter to accept, over enter new title: ")
+        if len(inputauthor) > 1:
+            bookInfo["author"] = inputauthor
+
+        bookInfo["year"] = input("Book Year: ")
+
+        bookInfo["safetitle"] = make_safe_filename(bookInfo["title"])
+        with open(infoPath, "w") as f:
+            json.dump(bookInfo, f)
+
+    return bookInfo
 
 def findsilence(part_filename):
-    global silenceparts
+
     # Load your audio.
     silenceseconds = 1
     thresholdamp = 0.01
@@ -234,13 +255,13 @@ def findsilence(part_filename):
 
         oarr = arr
 
-    silenceparts[make_safe_filename(part_filename)] = silencearray
+    return silencearray
 
-def build_chapter_object(part_filename):
+def build_chapter_object(part_filename, track_count, silenceparts):
     """
     Extracts Overdrive Markers from MP3 tag, stores them in list part_markers
     """
-    global part_markers, track_count, file_merged_start_time, silenceparts
+    audioparts = []
     audiofile = eyed3.load(part_filename)
     previous_chapter = "zycndkldms" ## Just a garbage value
 
@@ -302,8 +323,9 @@ def build_chapter_object(part_filename):
                     'closest_silence': closest_silence,
                     'start_time_hhmmss': convert_time(start_time),
                     'closest_silence_hhmmss': convert_time(closest_silence)}
-                part_markers.append(audiopart)
+                audioparts.append(audiopart)
         break
+    return audioparts, track_count
 
 def smooshChapters(part_markers):
     """
@@ -392,26 +414,25 @@ def smooshChapters(part_markers):
 
     return smooshed_chapters, track_number
 
-def writeMP3Tags(mp3file, chaptertitle, tracknumber):
+def writeMP3Tags(mp3file, chaptertitle, tracknumber, bookInfo):
     """
     Write output Mp3 file with title, author, cover
     """
-    global author, title, cover_bytes, year
 
     audiofile = eyed3.load(mp3file)
-    audiofile.tag.artist = author
-    audiofile.tag.album = title
-    audiofile.tag.album_artist = author
+    audiofile.tag.artist = bookInfo["author"]
+    audiofile.tag.album = bookInfo["title"]
+    audiofile.tag.album_artist = bookInfo["author"]
     audiofile.tag.title = chaptertitle
     audiofile.tag.track_num = tracknumber
-    audiofile.tag.recording_date = year
+    audiofile.tag.recording_date = bookInfo["year"]
     audiofile.tag.images.set(
-        art.TO_ID3_ART_TYPES[art.FRONT_COVER][0], cover_bytes, 'image/jpeg', description=u'Cover')
+        art.TO_ID3_ART_TYPES[art.FRONT_COVER][0], bookInfo["cover_bytes"], 'image/jpeg', description=u'Cover')
 
     audiofile.tag.save()
 
-def writeChapterFiles(chapters, totaltracks):
-    global failed_files
+def writeChapterFiles(chapters, totaltracks, filepaths, bookInfo):
+    failed_files = []
 
     leadingzeros = 2
     if totaltracks > 99:
@@ -472,12 +493,12 @@ def writeChapterFiles(chapters, totaltracks):
 
         ## Tag MP3 file
         if writemp3tags:
-            writeMP3Tags(outputpath, outputtitle, mp3tracknumber)
+            writeMP3Tags(outputpath, outputtitle, mp3tracknumber, bookInfo)
         
     return needsmerging
         
-def processMerges(chapters):
-    global failed_files, cover_bytes
+def processMerges(chapters, bookInfo):
+    failed_files = []
 
     ## Group by track number for safety
     df = pandas.DataFrame(chapters).sort_values(by=['filenumber'])
@@ -491,10 +512,12 @@ def processMerges(chapters):
         output = tracks.merge_output.min()
         written, successful = mergemp3s(input, output)
         if written:
-            writeMP3Tags(output, tracks.outputtitle.min(), tracks.mp3tracknumber.min())
+            writeMP3Tags(output, tracks.outputtitle.min(), tracks.mp3tracknumber.min(), bookInfo)
 
         if not successful:
             failed_files.append(track)
+
+    return failed_files
 
 def mergemp3s(files, output_filename):
     if os.path.isfile(output_filename):
@@ -526,38 +549,16 @@ def outputCSV(mydict, outname):
         fc.writeheader()
         fc.writerows(mydict)
 
-## Setup global variables. I bet this can be improved.
-part_markers = []
-track_count = 0
-file_merged_start_time = 0
-chapter_markers = []
-failed_files = []
-cover_bytes = None
-silenceparts = {}
-filepaths = {}
-title = ""
-author = ""
-year = 0
+def processDir(base_directory):
 
-def main():
-    global cover_bytes, silenceparts, filepaths
-
-    ## Setup the directory that this is working on
-    parser = argparse.ArgumentParser( )
-
-    parser.add_argument(
-        '-d', '--dir', dest='dir', default='.')
-
-    args = parser.parse_args()
-
-    base_directory = args.dir 
-    base_directory = base_directory.rstrip('\\')
-    base_directory = base_directory.rstrip('"')
-
-    base_directory = Path(base_directory)
+    silenceparts = {}
+    track_count = 0
+    part_markers = []
+    filepaths = {}
+    failed_files = []
 
     if not os.path.exists(base_directory):
-        print("Please select an existing directory for -d option")
+        print("Invalid directory passed to processDir")
         sys.exit(0)
 
     ## Get all MP3s in current directory
@@ -566,20 +567,20 @@ def main():
 
     if len(files) == 0:
         print("No Mp3 files found at that location")
-        sys.exit(0)
+        return
 
     ## Find cover art. Panic if not found currently.
     coverfile = [f for f in glob.glob("{}/*Cover.jpg".format(base_directory))]
     cover_filename = coverfile[0]
 
-    with open(cover_filename, 'rb') as f:
-        cover_bytes = f.read()
+    ## Get title, author, year.
+    bookInfo = verifyTitle(base_directory)
 
-    ## Get title, author, year. TODO - improve this.
-    verifyTitle(files[0])
+    with open(cover_filename, 'rb') as f:
+        bookInfo["cover_bytes"] = f.read()
 
     ## Set and create file directories
-    filepaths = getDirectories(base_directory)
+    filepaths = getDirectories(base_directory, bookInfo)
 
     ## Copy image to output directory
     copyfile(cover_filename, "{}/{}".format(filepaths['output_path'], os.path.basename(cover_filename)))
@@ -611,16 +612,19 @@ def main():
             if i == 1:
                 remainingtime = convert_time(50 * total) ## Takes roughly 50 seconds per file. Good enough for an estimate.
             print('{}'.format(colored.green("File {} of {}  --  Remaining time: {}").format(i, total, remainingtime)))
-            findsilence(filename) 
+            silenceparts[make_safe_filename(filename)] = findsilence(filename) 
+
             with open(silencefile, "w") as f:
                 json.dump(silenceparts, f)
 
     ## read embedded bookmark tags.
     for filename in files:
-        build_chapter_object(filename)
+        audioparts, track_count = build_chapter_object(filename, track_count, silenceparts)
+        for part in audioparts:
+            part_markers.append(part)
 
-    if output_debug_csvs:
-        outputCSV(part_markers, '{}/partmarkers.csv'.format(filepaths['temp_path']))
+    # if output_debug_csvs:
+    #     outputCSV(part_markers, '{}/partmarkers.csv'.format(filepaths['temp_path']))
 
     ## Combine chapter timestamps to have 1 output per chapter
     cuttimestamps, totaltracks = smooshChapters(part_markers)
@@ -634,7 +638,7 @@ def main():
     print('{}'.format(colored.green("-------------------")))
 
     #needsmerging = []
-    needsmerging = writeChapterFiles(cuttimestamps, totaltracks)
+    needsmerging = writeChapterFiles(cuttimestamps, totaltracks, filepaths, bookInfo)
 
     ## If any chapter spanned MP3s, combine them
     print('{}'.format(colored.green("-------------------")))
@@ -644,29 +648,64 @@ def main():
     if len(needsmerging) > 0:
         if output_debug_csvs:
             outputCSV(needsmerging, '{}/needsmerging.csv'.format(filepaths['temp_path']))
-        processMerges(needsmerging)
+        failed_files = processMerges(needsmerging, bookInfo)
     else:
         print("No files needed merging")
 
     ## TODO copy silence parts and cover.jpg to output dir
 
+    return failed_files, cuttimestamps
 
-    ## Write any failed files
-    if len(failed_files) > 0:
-        print("------")
-        print("Following are failed files:")
-        logger.error('{}'.format(
-            colored.red("There were failures in this run.")))
-        print('Error log Saved to FAILURES-{}.csv'.format(make_safe_filename(title)))
-        outputCSV(failed_files, 'FAILURES-{}.csv'.format(make_safe_filename(title)))
+def main():
 
-    ## Check for any chapters that weren't matched
-    for chapter in cuttimestamps:
-        ## Get all parts that match this chapter
-        if not chapter['silence_found']:
+    failures = {}
+    books = []
+
+    ## Setup the directory that this is working on
+    parser = argparse.ArgumentParser( )
+
+    parser.add_argument(
+        '-d', '--dir', dest='dir', default='.')
+
+    args = parser.parse_args()
+
+    subfolders = [ f.path for f in os.scandir(".") if f.is_dir() ]
+
+    for folder in subfolders:
+        base_directory = folder.rstrip('\\')
+        base_directory = folder.rstrip('"')
+
+        base_directory = Path(folder)
+        ## Get title, author, year. Save this for batch processing.
+        books.append(verifyTitle(base_directory))
+
+    ## Now that all input is gathered, run again
+    for book in books:
+
+        print('{}'.format(colored.blue("*******************")))
+        print('{}'.format(colored.blue("Processing {}").format(book["title"])))
+        print('{}'.format(colored.blue("*******************")))
+        failed_files, cuttimestamps = processDir(book["path"])
+        book["failed_files"] = failed_files
+        book["cuttimestamps"] = cuttimestamps
+
+    for book in books:    
+        ## Write any failed files
+        if len(book["failed_files"]) > 0:
+            print("------")
+            print("Following are failed files:")
             logger.error('{}'.format(
-                colored.red("Some chapters were placed on a spot without silence. Review the cuttimestamps.csv file.")))
-            break
+                colored.red("There were failures in this run.")))
+            print('Error log Saved to FAILURES-{}.csv'.format(book["safetitle"]))
+            outputCSV(failed_files, 'FAILURES-{}.csv'.format(book["safetitle"]))
+
+            ## Check for any chapters that weren't matched
+        for chapter in book["cuttimestamps"]:
+            ## Get all parts that match this chapter
+            if not chapter['silence_found']:
+                logger.error('{}'.format(
+                    colored.red("Some chapters were placed on a spot without silence, for {}. Review the cuttimestamps.csv file.").format(book["safetitle"])))
+                break
 
 if __name__ == "__main__":
     main()
