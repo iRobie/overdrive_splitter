@@ -19,6 +19,7 @@ import eyed3
 from eyed3.utils import art
 from mutagen.mp3 import MP3
 
+
 import numpy
 import json
 
@@ -31,6 +32,7 @@ logger.setLevel(logging.INFO)
 #### OPTIONS ######
 output_debug_csvs = True
 title_include_track_number = False # True: 01/09 - Title; False: Title
+folder_include_series = True # True: Series/Year - Album ; False: Year - Album
 overwrite_mp3tags = True # Write mp3 tags, even if ffmpeg doesn't process the file
 moveChapterToSilenceSeconds = 5 # If silence is found within this many seconds, move chapter mark to silence
 ###################
@@ -110,9 +112,12 @@ def mp3_duration_seconds(filename):
 def getDirectories(base_directory, bookInfo):
 
     filepaths = {}
-    filepaths['base_directory'] = base_directory ## Folder to store completed project. I set this as: BookTitle (Year)
-    filepaths['output_name'] = u'{} ({})'.format(make_safe_filename(bookInfo["title"]), str(bookInfo["year"])) ## Folder to store completed project. I set this as: BookTitle (Year)
+    filepaths['base_directory'] = base_directory
+    filepaths['output_name'] = u'{} - {}'.format(str(bookInfo["year"]), make_safe_filename(bookInfo["title"])) ## Folder to store completed project. I set this as: BookTitle (Year)
     filepaths['output_path'] = u'{}/{}'.format(base_directory, filepaths['output_name']) ## Making the final folder stay as a subdir of processing directory
+    if "series" in bookInfo:
+        if folder_include_series:
+            filepaths['output_path'] = u'{}/{}/{}'.format(base_directory, bookInfo["series"], filepaths['output_name']) ## Making the final folder stay as a subdir of processing directory
     filepaths['temp_path'] = u'{}/{}'.format(base_directory, 'temp') ## Making the final folder stay as a subdir of processing directory
 
     for key, value in filepaths.items():
@@ -173,6 +178,12 @@ def verifyTitle(base_directory):
         inputtitle = input("Press enter to accept, over enter new title: ")
         if len(inputtitle) > 1:
             bookInfo["title"] = inputtitle
+
+        seriestitle = input("Series Name (press enter to skip):")
+        if len(seriestitle) > 1:
+            bookInfo["series"] = seriestitle
+            bookNumber = input("Book number in series: ")
+            bookInfo["booknumber"] = bookNumber.zfill(2)
 
         print("Read author as: {}".format(bookInfo["author"]))
         inputauthor = input("Press enter to accept, over enter new title: ")
@@ -279,9 +290,12 @@ def build_chapter_object(part_filename, track_count, silenceparts):
             ## * Store Chapter by itself: "Chapter 1"
             ## * Split Chapter within a single part file: "Chapter 1", "Chapter 1 (12:01)"
             ## * Split Chapter across multiple part files, with or without the (12:01) above
+            ## * Also store as "Chapter 1 Part 1"
 
             ## chapter_section checks if chapter is split
             chapter_section = 0
+            partPattern = re.compile("^(.*) (Part \d+|continued)")
+            timestampPattern = re.compile("^(.*) (\(\d\d:\d\d\))") # Chapter 1 (12:01)
             for m in tree.iter('Marker'):
                 marker_name = m.find('Name').text.strip()
                 marker_timestamp = m.find('Time').text
@@ -289,9 +303,21 @@ def build_chapter_object(part_filename, track_count, silenceparts):
                 ## Store "Chapter 1" as previous timestamp; "Chapter 1 (12:01) starts with previous chapter"
                 ## New chapter name (should just be "Chapter 1")
                 if not marker_name.startswith(previous_chapter):
-                    previous_chapter = marker_name
-                    chapter_section = 0
-                ## Chapter name is "Chapter 1 (12:01)"
+                    m = re.match(partPattern, marker_name)
+                    t = re.match(timestampPattern, marker_name)
+                    if m:
+                        ## Chapter name "Chapter 1 Part 1"
+                        previous_chapter = m.groups()[0].strip()
+                        chapter_section = 0
+                    elif t:
+                        ## Chapter name "Chapter 1 (12:01) but didn't find previous chapter"
+                        previous_chapter = t.groups()[0].strip()
+                        chapter_section = 0
+                    else:
+                        ## Just "Chapter 1"
+                        previous_chapter = marker_name
+                        chapter_section = 0
+                ## Chapter is continuing previous chapter - "Chapter 1 (12:01)" or "Chapter 1 Part 2"
                 else:
                     chapter_section += 1
 
@@ -414,6 +440,7 @@ def smooshChapters(part_markers):
 
     return smooshed_chapters, track_number
 
+
 def writeMP3Tags(mp3file, chaptertitle, tracknumber, bookInfo):
     """
     Write output Mp3 file with title, author, cover
@@ -425,6 +452,13 @@ def writeMP3Tags(mp3file, chaptertitle, tracknumber, bookInfo):
     audiofile.tag.album_artist = bookInfo["author"]
     audiofile.tag.title = chaptertitle
     audiofile.tag.track_num = tracknumber
+    if "series" in bookInfo:
+        # https://eyed3.readthedocs.io/en/latest/_modules/eyed3/id3/frames.html
+        seriesFullName = "{}, Book {}".format(bookInfo["series"], bookInfo["booknumber"])
+        audiofile.tag.frame_set.setTextFrame(b"TIT3",seriesFullName) # Subtitle, or Track/More
+        audiofile.tag.frame_set.setTextFrame(b"TPOS",bookInfo["booknumber"]) # Disc number/part position
+        audiofile.tag.frame_set.setTextFrame(b"TSOA",seriesFullName) # Album sort order
+        #audiofile.tag.frame_set.setTextFrame(b"TSST",seriesFullName) # Set Subtitle
     audiofile.tag.recording_date = bookInfo["year"]
     audiofile.tag.images.set(
         art.TO_ID3_ART_TYPES[art.FRONT_COVER][0], bookInfo["cover_bytes"], 'image/jpeg', description=u'Cover')
