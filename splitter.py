@@ -85,6 +85,25 @@ def convert_time(time_secs):
     hour, min = divmod(min, 60)
     return f"{hour:02}:{min:02}:{sec:02}.{fraction:03}"
 
+def cueOffsetToSeconds(offset):
+    """
+    Convert cue time M:S:FF to total number of seconds
+    """
+    offset = offset.split(':')
+    if len(offset) == 1:
+        offset = datetime.timedelta(minutes=int(offset[0]))
+    elif len(offset) == 2:
+        offset = datetime.timedelta(minutes=int(offset[0]), seconds=int(offset[1]))
+    elif len(offset) == 3:
+        if len(offset[2]) < 3:
+            offset[2] += "0"
+        offset = datetime.timedelta(minutes=int(offset[0]), seconds=int(offset[1]),
+                           milliseconds=int(offset[2]))
+        ts_mark = int(offset.total_seconds())
+    else:
+        print("Wrong offset value")
+        exit()
+    return ts_mark
 
 def closestSilence(times, chapter, threshold):   
     """
@@ -583,6 +602,64 @@ def outputCSV(mydict, outname):
         fc.writeheader()
         fc.writerows(mydict)
 
+def parseCue(cuefile, silenceparts):
+    if not os.path.isfile(cuefile):
+        print("Cannot open file %s" % cuefile)
+        sys.exit(2)
+    audioparts = []
+    audiopart = {}
+    mp3filename = cuefile.replace("cue", "mp3")
+    track_count = 0
+    marker_name = ""
+    f = open(cuefile, "r")
+    for x in f:
+        ## Check if we're on a new track
+        track = re.match('^TRACK.*$', x)
+        if track:
+            ## If there's information, process it and create new empty part
+            if bool(audiopart):
+                audiopart = {}
+                continue
+        ## Check if we're on a title
+        titlematch = re.match('\s+TITLE\s?"(.*)"$', x)
+        if titlematch:
+            ## If there's information, process it and create new empty part
+            title = titlematch.groups()[0].strip()
+            marker_name = title
+            continue
+        indexmatch = re.match('\s+INDEX\s?\d+\s?(.*)$', x)
+        if indexmatch:
+            timestamp = indexmatch.groups()[0].strip()
+            ts_mark = cueOffsetToSeconds(timestamp)
+            start_time = ts_mark
+            old_start_time = start_time
+            track_count += 1
+
+            ## TODO: fix this up
+            closest_silence = closestSilence(silenceparts[make_safe_filename(mp3filename)], ts_mark, moveChapterToSilenceSeconds)
+            silence_found = False
+
+            timedifference = abs(closest_silence-ts_mark)
+            if timedifference < moveChapterToSilenceSeconds:
+                start_time = closest_silence
+                silence_found = True
+
+            audiopart = {
+                'filename': mp3filename, 
+                'file_number': track_count,
+                'chapter_name': marker_name,
+                'chapter_section': 0,
+                'start_time': start_time,
+                'old_start_time': old_start_time,
+                'difference': timedifference,
+                'silence_found': silence_found,
+                'closest_silence': closest_silence,
+                'start_time_hhmmss': convert_time(start_time),
+                'closest_silence_hhmmss': convert_time(closest_silence)}
+            audioparts.append(audiopart)
+
+    return audioparts, track_count
+
 def processDir(base_directory):
 
     silenceparts = {}
@@ -619,6 +696,7 @@ def processDir(base_directory):
     ## Copy image to output directory
     copyfile(cover_filename, "{}/{}".format(filepaths['output_path'], os.path.basename(cover_filename)))
 
+
     ## Look for an load a previous silence file. This saves time on reprocessing.
     silencefile = Path("{}/silenceparts.json".format(filepaths['temp_path'], ))
     if silencefile.exists ():
@@ -651,11 +729,20 @@ def processDir(base_directory):
             with open(silencefile, "w") as f:
                 json.dump(silenceparts, f)
 
-    ## read embedded bookmark tags.
-    for filename in files:
-        audioparts, track_count = build_chapter_object(filename, track_count, silenceparts)
+    cuefiles = [f for f in glob.glob("{}/*.cue".format(base_directory))]
+    if cuefiles:
+        print("Processing cue file.")
+        cue_filename = cuefiles[0]
+        audioparts, track_count = parseCue(cue_filename, silenceparts)
         for part in audioparts:
             part_markers.append(part)
+
+    ## read embedded bookmark tags.
+    else:
+        for filename in files:
+            audioparts, track_count = build_chapter_object(filename, track_count, silenceparts)
+            for part in audioparts:
+                part_markers.append(part)
 
     # if output_debug_csvs:
     #     outputCSV(part_markers, '{}/partmarkers.csv'.format(filepaths['temp_path']))
